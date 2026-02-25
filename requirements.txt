@@ -1,0 +1,7 @@
+colorama==0.4.6
+frida==17.7.3
+frida-tools==14.6.0
+prompt_toolkit==3.0.52
+Pygments==2.19.2
+wcwidth==0.6.0
+websockets==13.1
