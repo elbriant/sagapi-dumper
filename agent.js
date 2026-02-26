@@ -6,6 +6,7 @@ setTimeout(function () {
     log("\n[+] Initializing Arknights Memory Scanner (Dynamic Heuristic V3.2)...");
 
     var MAX_CHUNK = 4 * 1024 * 1024; // Transmit in 4MB chunks to prevent Frida from crashing
+    var foundVersion = "Unknown";
 
     // ==========================================
     // 1. DUMP LIBIL2CPP
@@ -95,6 +96,7 @@ setTimeout(function () {
                             if (maxSize > 0) {
                                 metaBase = testBase;
                                 realSize = maxSize;
+                                foundVersion = version;
                                 break;
                             }
                         }
@@ -148,7 +150,8 @@ setTimeout(function () {
     // Signal Python script to terminate and send the real Base Address
     send({
         type: 'done',
-        base_addr: lib.base.toString()
+        base_addr: lib.base.toString(),
+        metadata_version: foundVersion
     });
 
 }, 5000);

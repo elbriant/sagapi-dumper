@@ -6,6 +6,8 @@ import threading
 import urllib.request
 import zipfile
 import io
+import json
+from datetime import datetime, timezone
 
 # ======== CONFIGURATION ========
 DUMPER_DIR = "il2cppdumper"
@@ -43,6 +45,18 @@ def setup_il2cppdumper():
 
 setup_il2cppdumper()
 
+def get_app_version(app_id):
+    """Consulta la versión del APK directamente usando ADB"""
+    try:
+        # Pide a Android que nos de la información del paquete
+        out = subprocess.check_output(f"adb shell dumpsys package {app_id}", shell=True, text=True)
+        for line in out.split('\n'):
+            if "versionName=" in line:
+                return line.split('=')[1].strip()
+    except Exception:
+        pass
+    return "Unknown"
+
 # --- FRIDA RECEIVER SYSTEM ---
 def on_message(message, data):
     global base_address_final, dumps_dir
@@ -69,6 +83,26 @@ def on_message(message, data):
             
         elif payload['type'] == 'done':
             base_address_final = payload['base_addr']
+            
+            # --- Manifest.json ---
+            app_version = get_app_version(app_id)
+            meta_version = payload.get('metadata_version', 'Unknown')
+            
+            manifest_data = {
+                "package_name": app_id,
+                "app_version": app_version,
+                "metadata_version": meta_version,
+                "libil2cpp_base": base_address_final,
+                "dump_date": datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
+            }
+            
+            manifest_path = os.path.join(output_dir, "manifest.json")
+            with open(manifest_path, "w", encoding="utf-8") as m:
+                json.dump(manifest_data, m, indent=4)
+                
+            print(f"[*] PC: manifest.json generated (App: v{app_version} | Meta: v{meta_version}).")
+            # -----------------------------------------
+            
             done_event.set()
 
 # --- MAIN PROCESS ---
