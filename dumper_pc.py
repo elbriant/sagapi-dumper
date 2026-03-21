@@ -7,6 +7,7 @@ import urllib.request
 import zipfile
 import io
 import json
+import shutil
 from datetime import datetime, timezone
 
 # ======== CONFIGURATION ========
@@ -149,6 +150,15 @@ print(f"\n==================================================")
 print(f"[*] STARTING IL2CPPDUMPER FOR: {app_id}")
 print(f"[*] Injecting Base Address: {base_address_final}")
 print(f"==================================================\n")
+
+# dll folder cleanup (i dont know why sometimes dont work without this)
+dll_subfolder = os.path.join(output_dir, "DummyDlls")
+if os.path.exists(dll_subfolder):
+    try:
+        shutil.rmtree(dll_subfolder)
+        print("[*] PC: Old folder cleaned. Clean slate ready.")
+    except Exception as e:
+        print(f"[-] Warning: Could not clean the old folder: {e}")
 
 try:
     # Dynamic paths for the dumper
