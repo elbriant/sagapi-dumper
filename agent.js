@@ -2,10 +2,125 @@ function log(msg) {
     send({ type: 'log', msg: msg });
 }
 
+// ==========================================
+// 0. ANTI-DETECTION LAYER (best-effort, hides Frida's presence)
+//    Set ANTI_DETECT = false to disable.
+// ==========================================
+var ANTI_DETECT = true;
+
+function antiDetect() {
+    var MARKERS = ["frida", "gum-js-loop", "gum-graft", "frida-server", "linjector"];
+
+    function isMarker(s) {
+        if (!s) return false;
+        var l = s.toLowerCase();
+        for (var i = 0; i < MARKERS.length; i++) {
+            if (l.indexOf(MARKERS[i]) !== -1) return true;
+        }
+        return false;
+    }
+
+    // Frida 17 removed the static Module.findExportByName(...) form; resolve
+    // exports via the libc module's instance method instead.
+    function findExport(name) {
+        var mods = ["libc.so", "libc.bionic.so"];
+        for (var i = 0; i < mods.length; i++) {
+            var m = Process.findModuleByName(mods[i]);
+            if (m) {
+                var e = m.findExportByName(name);
+                if (e) return e;
+            }
+        }
+        try { return Module.findGlobalExportByName(name); } catch (e) { return null; }
+    }
+
+    // Each hook is isolated: one failure must never kill the others.
+    function hook(exp, onEnter, onLeave) {
+        try {
+            var p = findExport(exp);
+            if (!p) return;
+            Interceptor.attach(p, {
+                onEnter: function (args) {
+                    try { if (onEnter) onEnter.call(this, args); } catch (e) { }
+                },
+                onLeave: function (retval) {
+                    try { if (onLeave) onLeave.call(this, retval); } catch (e) { }
+                }
+            });
+            log("[+] anti-detect hook installed: " + exp);
+        } catch (e) {
+            log("[-] anti-detect hook failed: " + exp + ": " + e);
+        }
+    }
+
+    try {
+        // 1) String compare/search functions: fake "not found" when a Frida marker
+        //    string is involved, so the game's string-based checks never match.
+        hook("strcmp", function (args) {
+            try {
+                this.a = args[0].readCString(128);
+                this.b = args[1].readCString(128);
+            } catch (e) { this.a = null; this.b = null; }
+        }, function (retval) {
+            if (isMarker(this.a) || isMarker(this.b)) retval.replace(1);
+        });
+        hook("strncmp", function (args) {
+            try {
+                this.a = args[0].readCString(128);
+                this.b = args[1].readCString(128);
+            } catch (e) { this.a = null; this.b = null; }
+        }, function (retval) {
+            if (isMarker(this.a) || isMarker(this.b)) retval.replace(1);
+        });
+        hook("strcasestr", function (args) {
+            try { this.needle = args[1].readCString(128); } catch (e) { this.needle = null; }
+        }, function (retval) {
+            if (isMarker(this.needle)) retval.replace(ptr(0));
+        });
+        hook("strstr", function (args) {
+            try { this.needle = args[1].readCString(128); } catch (e) { this.needle = null; }
+        }, function (retval) {
+            if (isMarker(this.needle)) retval.replace(ptr(0));
+        });
+    } catch (e) { log("[-] anti-detect str hooks failed: " + e); }
+
+    try {
+        // 2) Blank any /proc/self/{maps,task,status,comm} line that reveals Frida.
+        //    NOTE: covers caller's fgets(); direct read(2) on these files is NOT hidden.
+        var procFiles = {};
+        hook("fopen", function (args) {
+            try { this.path = args[0].readCString(); } catch (e) { this.path = null; }
+        }, function (retval) {
+            if (this.path && this.path.indexOf("/proc/") !== -1 && !retval.isNull()) {
+                procFiles[retval.toInt32()] = this.path;
+            }
+        });
+        hook("fgets", function (args) {
+            this.buf = args[0];
+            this.fp = args[2].toInt32();
+        }, function (retval) {
+            if (retval.isNull()) return;
+            var path = procFiles[this.fp];
+            if (!path) return;
+            if (path.indexOf("maps") !== -1 || path.indexOf("/task/") !== -1 ||
+                path.indexOf("status") !== -1 || path.indexOf("comm") !== -1) {
+                try {
+                    var line = this.buf.readCString(256);
+                    if (isMarker(line)) this.buf.writeUtf8String("\n");
+                } catch (e) { }
+            }
+        });
+    } catch (e) { log("[-] anti-detect /proc hooks failed: " + e); }
+}
+
+if (ANTI_DETECT) {
+    try { antiDetect(); } catch (e) { log("[-] anti-detect failed: " + e); }
+}
+
 setTimeout(function () {
     log("\n[+] Initializing Arknights Memory Scanner (Dynamic Heuristic V3.2)...");
 
-    var MAX_CHUNK = 4 * 1024 * 1024; // Transmit in 4MB chunks to prevent Frida from crashing
+    var MAX_CHUNK = 64 * 1024 * 1024; // Fewest round-trips = least exposure time; anti-cheat kills frida-server if dump is slow
     var foundVersion = "Unknown";
 
     // ==========================================
@@ -14,28 +129,44 @@ setTimeout(function () {
     var lib = Process.getModuleByName("libil2cpp.so");
     log("[+] libil2cpp.so base: " + lib.base + " | Size: " + (lib.size / 1024 / 1024).toFixed(2) + " MB");
 
-    // Notify PC to prepare the file
     send({ type: 'init_file', name: 'libil2cpp.so', size: lib.size });
 
     log("[*] Transferring readable memory blocks to PC...");
-    var ranges = lib.enumerateRanges('r--'); // Filter for readable memory
+    // Do NOT trust lib.enumerateRanges(): the anti-cheat can make Frida's
+    // module parser hallucinate a ghost range ~full-module-size located
+    // outside [base, base+size). Use the kernel's own process memory map
+    // and clip every readable range to the module span instead.
+    var libEnd = lib.base.add(lib.size);
+    var procRanges = Process.enumerateRanges('r--');
+    var sentTotal = 0;
 
-    ranges.forEach(function (r) {
-        var rOffset = r.base.sub(lib.base).toInt32();
-        var rSize = r.size;
+    procRanges.forEach(function (r) {
+        var rEnd = r.base.add(r.size);
+        var s = r.base.compare(lib.base) < 0 ? lib.base : r.base;
+        var e = rEnd.compare(libEnd) > 0 ? libEnd : rEnd;
+        if (e.compare(s) <= 0) return;
 
-        // Split into 4MB chunks for large memory blocks
+        var rOffset = s.sub(lib.base).toUInt32();
+        var rSize = e.sub(s).toUInt32();
+
         for (var i = 0; i < rSize; i += MAX_CHUNK) {
             var remain = rSize - i;
             var readSize = remain < MAX_CHUNK ? remain : MAX_CHUNK;
             try {
-                var buf = r.base.add(i).readByteArray(readSize);
+                var buf = s.add(i).readByteArray(readSize);
                 send({ type: 'write_chunk', name: 'libil2cpp.so', offset: rOffset + i }, buf);
-            } catch (e) {
+                sentTotal += readSize;
+            } catch (err) {
                 // Ignore memory pages protected by the kernel
             }
         }
     });
+
+    if (sentTotal < lib.size * 0.1) {
+        log("[-] WARNING: only " + (sentTotal / 1024 / 1024).toFixed(2) +
+            " MB readable inside module span; the real code may be remapped elsewhere.");
+    }
+    log("[*] Transferred " + (sentTotal / 1024 / 1024).toFixed(2) + " MB of libil2cpp.so");
     send({ type: 'finish_file', name: 'libil2cpp.so' });
 
     // ==========================================
@@ -44,7 +175,14 @@ setTimeout(function () {
     log("\n[*] Scanning RAM for global-metadata...");
     var pattern = "55 6e 69 74 79 45 6e 67 69 6e 65 2e 43 6f 72 65 4d 6f 64 75 6c 65 2e 64 6c 6c";
 
-    var memRanges = Process.enumerateRanges('rw-');
+    // The metadata block is ~37MB, so skip tiny ranges and scan the biggest
+    // candidates first: the anchor is found in the very first scanSync instead
+    // of after sweeping dozens of ranges (shorter exposure = fewer kills).
+    // NOTE: the spoofed-version heuristic relies on version being 24..31; do not
+    // weaken the filter below or the anchor search may scan unrelated regions.
+    var memRanges = Process.enumerateRanges('rw-')
+        .filter(function (r) { return r.size >= 2 * 1024 * 1024; })
+        .sort(function (a, b) { return b.size - a.size; });
     var found = false;
 
     for (var j = 0; j < memRanges.length; j++) {
@@ -104,6 +242,17 @@ setTimeout(function () {
                 } catch (e) { }
             }
 
+            // Reject anchors whose calculated size is absurdly large —
+            // a valid global-metadata.dat is never > 80 MB. A wrong anchor
+            // makes the heuristic over-estimate and readByteArray then walks
+            // past the real data into guard pages, producing the
+            // "access violation" seen on the PC side.
+            if (metaBase !== null && realSize > 80 * 1024 * 1024) {
+                log("[-] Skipping anchor: calculated size " + realSize + " bytes is unrealistic.");
+                metaBase = null;
+                realSize = 0;
+            }
+
             if (metaBase !== null && realSize > 0) {
                 log("[+] Anchor found at: " + anchorAddr);
                 log("[+] Metadata header dynamically detected at: " + metaBase);
@@ -146,12 +295,11 @@ setTimeout(function () {
     }
 
     log("\n[+] RAM extraction completed. Handing control over to PC...");
-
-    // Signal Python script to terminate and send the real Base Address
     send({
         type: 'done',
         base_addr: lib.base.toString(),
-        metadata_version: foundVersion
+        metadata_version: foundVersion,
+        metadata_ok: found
     });
 
 }, 5000);
