@@ -1,5 +1,12 @@
 .venv
+__pycache__/
 dumps/*
 il2cppdumper
 commands.txt
 digest.txt
+DummyDlls/**/dump.cs
+DummyDlls/**/il2cpp.h
+DummyDlls/**/script.json
+DummyDlls/**/stringliteral.json
+app.apk
+frida-server

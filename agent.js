@@ -118,7 +118,7 @@ if (ANTI_DETECT) {
 }
 
 setTimeout(function () {
-    log("\n[+] Initializing Arknights Memory Scanner (Dynamic Heuristic V3.2)...");
+    log("\n[+] Initializing Arknights Memory Scanner (Dynamic Heuristic V3.3)...");
 
     var MAX_CHUNK = 64 * 1024 * 1024; // Fewest round-trips = least exposure time; anti-cheat kills frida-server if dump is slow
     var foundVersion = "Unknown";
@@ -173,125 +173,238 @@ setTimeout(function () {
     // 2. DUMP GLOBAL-METADATA (DYNAMIC HEURISTIC ALGORITHM)
     // ==========================================
     log("\n[*] Scanning RAM for global-metadata...");
-    var pattern = "55 6e 69 74 79 45 6e 67 69 6e 65 2e 43 6f 72 65 4d 6f 64 75 6c 65 2e 64 6c 6c";
+    var anchorPat = "55 6e 69 74 79 45 6e 67 69 6e 65 2e 43 6f 72 65 4d 6f 64 75 6c 65 2e 64 6c 6c"; // UnityEngine.CoreModule.dll
+    var magicPat = "af 1b b1 fa";
 
-    // The metadata block is ~37MB, so skip tiny ranges and scan the biggest
-    // candidates first: the anchor is found in the very first scanSync instead
-    // of after sweeping dozens of ranges (shorter exposure = fewer kills).
-    // NOTE: the spoofed-version heuristic relies on version being 24..31; do not
-    // weaken the filter below or the anchor search may scan unrelated regions.
-    var memRanges = Process.enumerateRanges('rw-')
-        .filter(function (r) { return r.size >= 2 * 1024 * 1024; })
-        .sort(function (a, b) { return b.size - a.size; });
+    // HOW THE METADATA RESIDES IN RAM DIFFERS PER BUILD, so scan ALL readable
+    // ranges instead of only 'rw-':
+    //   - older clients malloc() the buffer    -> rw- anonymous range
+    //   - 37.x clients mmap() the extracted file READ-ONLY
+    //     (.../Android/data/<pkg>/files/il2cpp/Metadata/global-metadata.dat,
+    //      r-- file-backed). Scanning only 'rw-' (pre-V3.3) never sees it and
+    //     reports "Could not dynamically resolve metadata" although it IS in RAM.
+    // NOTE: in Frida, enumerateRanges('r--') is a MASK match: it returns every
+    // readable range (r--, rw- and r-x alike) - verified 3097 == all readable.
+    var SCAN_BUDGET = 1024 * 1024 * 1024; // max bytes per pass: bounds anti-cheat exposure
+    // OJO: NO se puede filtrar "/dev/" en bloque. El build 37.x del server TW
+    // NO mapea el global-metadata.dat: lo lee cifrado del disco y lo
+    // descifra en un buffer anonimo sobre /dev/zero (r-- / rw- "(deleted)"),
+    // que es justo donde vive el metadata. Ese path cae en "/dev/" y el
+    // filtro lo descartaba -> "Could not dynamically resolve metadata".
+    var SKIP_PATH = [".so", "/lib/arm64/", ".jar", ".ttf", "/apex/", "/system/",
+        "/dev/kgsl", "/dev/ashmem", "/dev/__properties__", "/dev/binder",
+        "/dev/dmabuf", "/dev/socket", "kgsl", "dmabuf", "binder", "ashmem",
+        "jit-", "icudt", "dalvik"];
+
+    var mods = Process.enumerateModules();
+    function insideModule(r) {
+        for (var mi = 0; mi < mods.length; mi++) {
+            var mm = mods[mi];
+            if (r.base.compare(mm.base) >= 0 && r.base.compare(mm.base.add(mm.size)) < 0) return true;
+        }
+        return false;
+    }
+
+    var candidates = [], seenBase = {};
+    Process.enumerateRanges('r--').forEach(function (r) {
+        var key = r.base.toString();
+        if (seenBase[key]) return;
+        seenBase[key] = 1;
+        if (r.size < 256 * 1024 || r.size > 512 * 1024 * 1024) return;
+        if (insideModule(r)) return; // module .rodata holds a copy of the anchor: pure false-positive bait
+        var p = r.file ? r.file.path : "";
+        for (var si = 0; si < SKIP_PATH.length; si++) {
+            if (p.indexOf(SKIP_PATH[si]) !== -1) return; // code/GPU/jit/system mappings never hold metadata
+        }
+        candidates.push({ r: r, path: p });
+    });
+    // Prioridad de busqueda del metadata:
+    //  0) rango cuyo path contiene "global-metadata" -> el archivo mapeado
+    //     con mmap() (clientes que no cifran el metadata).
+    //  1) rango cuyo path contiene "/dev/zero" -> buffer desencriptado en
+    //     memoria por el protector (builds que cifran el metadata en disco).
+    //  2) el resto, del rango mas grande al mas pequeno (buffer malloc()).
+    function pathPriority(p) {
+        if (p.indexOf("global-metadata") !== -1) return 0;
+        if (p.indexOf("/dev/zero") !== -1) return 1;
+        return 2;
+    }
+    candidates.sort(function (a, b) {
+        var pa = pathPriority(a.path), pb = pathPriority(b.path);
+        if (pa !== pb) return pa - pb;
+        if (pa === 2) return b.r.size - a.r.size;
+        return 0;
+    });
+    log("[*] " + candidates.length + " candidate readable ranges (non-module, 256KB..512MB)");
+
+    // scanSync aborts the whole range on a hole; retry in 1MB blocks instead.
+    function scanSafe(base, size, pat) {
+        try {
+            return Memory.scanSync(base, size, pat);
+        } catch (e) {
+            var out = [];
+            for (var off = 0; off < size; off += 0x100000) {
+                var n = Math.min(0x100000, size - off);
+                try { out = out.concat(Memory.scanSync(base.add(off), n, pat)); } catch (e2) { }
+            }
+            return out;
+        }
+    }
+
+    var rejectNotes = [];
+    // Same validation the original walk-back used: spoofed builds report
+    // version 24, honest builds report their true version (29/31/...), and
+    // both must yield a plausible section table. `where` labels the caller
+    // so a rejection says WHICH pass rejected it.
+    function readHeader(addr, where) {
+        try {
+            var version = addr.add(4).readInt();
+            if (version < 24 || version > 40) {
+                if (rejectNotes.length < 8) rejectNotes.push("      " + where + " " + addr + ": version " + version + " outside 24..40");
+                return null;
+            }
+            var strOffset = addr.add(8).readInt();
+            if (strOffset <= 0 || strOffset >= 100 * 1024 * 1024) {
+                if (rejectNotes.length < 8) rejectNotes.push("      " + where + " " + addr + ": v" + version + " but strOffset " + strOffset + " is implausible");
+                return null;
+            }
+
+            var maxSize = 0, minOffset = 0xFFFFFFF, pi = 0;
+            while (true) {
+                var fieldOffset = 8 + pi * 8;
+                if (fieldOffset >= minOffset) break;
+
+                var off = addr.add(fieldOffset).readInt();
+                var sz = addr.add(fieldOffset + 4).readInt();
+
+                if (off > 0 && off < minOffset) minOffset = off;
+                if (off + sz > maxSize) maxSize = off + sz;
+
+                pi++;
+                if (pi > 50) break;
+            }
+
+            if (maxSize <= 0) {
+                if (rejectNotes.length < 8) rejectNotes.push("      " + where + " " + addr + ": v" + version + " but empty section table");
+                return null;
+            }
+            // A valid global-metadata.dat is never > 80 MB. A wrong candidate
+            // over-estimates size and readByteArray then walks past the real
+            // data into guard pages -> "access violation" on the PC side.
+            if (maxSize > 80 * 1024 * 1024) {
+                log("[-] Skipping " + where + " candidate " + addr + ": calculated size " + maxSize + " bytes is unrealistic.");
+                return null;
+            }
+            return { version: version, size: maxSize };
+        } catch (e) { return null; }
+    }
+
+    var metaBase = null, realSize = 0;
+    var magicHits = 0, anchorHits = 0, budgetHit = false;
     var found = false;
 
-    for (var j = 0; j < memRanges.length; j++) {
-        var rMeta = memRanges[j];
-        if (rMeta.size > 50 * 1024 * 1024) continue;
+    // ---- PASS 1: the real AF1BB1FA magic (37.x does NOT spoof it in RAM) ----
+    var scanned1 = 0;
+    for (var ci = 0; ci < candidates.length && !metaBase; ci++) {
+        var cand1 = candidates[ci];
+        if (scanned1 >= SCAN_BUDGET) { budgetHit = true; break; }
+        var mHits = scanSafe(cand1.r.base, cand1.r.size, magicPat);
+        scanned1 += cand1.r.size;
+        magicHits += mHits.length;
+        for (var mgi = 0; mgi < mHits.length; mgi++) {
+            var hdr1 = readHeader(mHits[mgi].address, "magic");
+            if (!hdr1) continue;
+            metaBase = mHits[mgi].address;
+            realSize = hdr1.size;
+            foundVersion = hdr1.version;
+            log("[+] Real metadata header (AF1BB1FA v" + hdr1.version + ") found at: " + metaBase +
+                (cand1.path ? " [" + cand1.path + "]" : ""));
+            break;
+        }
+    }
+    log("[*] Pass 1 (magic): " + (scanned1 / 1048576).toFixed(0) + " MB scanned, " + magicHits + " raw hit(s), header " + (metaBase ? "FOUND" : "not found"));
 
-        var matches = Memory.scanSync(rMeta.base, rMeta.size, pattern);
-        if (matches.length > 0) {
-            var anchorAddr = matches[0].address;
-            var metaBase = null;
-            var realSize = 0;
+    // ---- PASS 2: anchor walk-back (covers builds that spoof the header bytes) ----
+    if (!metaBase) {
+        log("[*] Pass 2: UnityEngine.CoreModule.dll anchor walk-back...");
+        var scanned2 = 0;
+        for (var cj = 0; cj < candidates.length && !metaBase; cj++) {
+            var cand2 = candidates[cj];
+            if (scanned2 >= SCAN_BUDGET) { budgetHit = true; break; }
+            var aHits = scanSafe(cand2.r.base, cand2.r.size, anchorPat);
+            scanned2 += cand2.r.size;
+            anchorHits += aHits.length;
+            if (aHits.length === 0) continue;
+            log("[*] Anchor x" + aHits.length + " in " + cand2.r.base + " (" +
+                (cand2.r.size / 1048576).toFixed(1) + "MB " + cand2.r.protection +
+                (cand2.path ? " " + cand2.path : "") + ")");
 
-            var possibleBases = [rMeta.base];
-            var pageAligned = anchorAddr.sub(anchorAddr.toInt32() % 4096);
-            while (pageAligned.compare(rMeta.base) >= 0) {
-                if (!pageAligned.equals(rMeta.base)) {
-                    possibleBases.push(pageAligned);
-                }
-                pageAligned = pageAligned.sub(4096);
-            }
-
-            for (var k = 0; k < possibleBases.length; k++) {
-                var testBase = possibleBases[k];
-                try {
-                    // The game spoofs the version to 24, we allow finding it to locate the header
-                    var version = testBase.add(4).readInt();
-                    if (version >= 24 && version <= 31) {
-                        var strOffset = testBase.add(8).readInt();
-                        if (strOffset > 0 && strOffset < 100 * 1024 * 1024) {
-
-                            var maxSize = 0;
-                            var minOffset = 0xFFFFFFF;
-                            var p = 0;
-
-                            while (true) {
-                                var fieldOffset = 8 + p * 8;
-                                if (fieldOffset >= minOffset) break;
-
-                                var offset = testBase.add(fieldOffset).readInt();
-                                var size = testBase.add(fieldOffset + 4).readInt();
-
-                                if (offset > 0 && offset < minOffset) minOffset = offset;
-                                if (offset + size > maxSize) maxSize = offset + size;
-
-                                p++;
-                                if (p > 50) break;
-                            }
-
-                            if (maxSize > 0) {
-                                metaBase = testBase;
-                                realSize = maxSize;
-                                foundVersion = version;
-                                break;
-                            }
-                        }
+            // The old code only tested matches[0]; test EVERY hit, otherwise a
+            // stray copy of the anchor elsewhere in the range masks the real one.
+            for (var ai = 0; ai < aHits.length && !metaBase; ai++) {
+                var anchorAddr = aHits[ai].address;
+                var pageAligned = anchorAddr.and(ptr("0xfffffffffffff000"));
+                var steps = 0;
+                while (pageAligned.compare(cand2.r.base) >= 0 && steps++ < 262144) {
+                    // +0 for mmap'd buffers, +8..56 for allocator chunk headers
+                    // (scudo stores one right after the page start, so a large
+                    // malloc()'d buffer is NOT page-aligned).
+                    for (var aoff = 0; aoff < 64 && !metaBase; aoff += 8) {
+                        var testBase = pageAligned.add(aoff);
+                        if (testBase.compare(cand2.r.base) < 0) continue;
+                        var hdr2 = readHeader(testBase, "anchor");
+                        if (!hdr2) continue;
+                        metaBase = testBase;
+                        realSize = hdr2.size;
+                        foundVersion = hdr2.version;
+                        log("[+] Anchor found at: " + anchorAddr);
+                        log("[+] Metadata header dynamically detected at: " + metaBase);
+                        log("[+] Calculated actual size: " + realSize + " bytes");
                     }
-                } catch (e) { }
-            }
-
-            // Reject anchors whose calculated size is absurdly large —
-            // a valid global-metadata.dat is never > 80 MB. A wrong anchor
-            // makes the heuristic over-estimate and readByteArray then walks
-            // past the real data into guard pages, producing the
-            // "access violation" seen on the PC side.
-            if (metaBase !== null && realSize > 80 * 1024 * 1024) {
-                log("[-] Skipping anchor: calculated size " + realSize + " bytes is unrealistic.");
-                metaBase = null;
-                realSize = 0;
-            }
-
-            if (metaBase !== null && realSize > 0) {
-                log("[+] Anchor found at: " + anchorAddr);
-                log("[+] Metadata header dynamically detected at: " + metaBase);
-                log("[+] Calculated actual size: " + realSize + " bytes");
-
-                send({ type: 'init_file', name: 'global-metadata.dat', size: realSize });
-                log("[*] Transferring metadata to PC and restoring Version 29 header...");
-
-                try {
-                    for (var offset = 0; offset < realSize; offset += MAX_CHUNK) {
-                        var remainMeta = realSize - offset;
-                        var readSizeMeta = remainMeta < MAX_CHUNK ? remainMeta : MAX_CHUNK;
-                        var bufMeta = metaBase.add(offset).readByteArray(readSizeMeta);
-
-                        if (offset === 0) {
-                            // Force Magic Bytes + Version 29 (0x1D) to bypass memory spoofing
-                            var magic8 = [0xAF, 0x1B, 0xB1, 0xFA, 0x1D, 0x00, 0x00, 0x00];
-
-                            var tempMem = Memory.alloc(readSizeMeta);
-                            tempMem.writeByteArray(bufMeta);
-                            tempMem.writeByteArray(magic8); // Overwrite the first 8 bytes
-                            bufMeta = tempMem.readByteArray(readSizeMeta);
-                        }
-
-                        send({ type: 'write_chunk', name: 'global-metadata.dat', offset: offset }, bufMeta);
-                    }
-                    send({ type: 'finish_file', name: 'global-metadata.dat' });
-                    found = true;
-                    break;
-                } catch (e) {
-                    log("[-] Error transferring metadata: " + e);
+                    pageAligned = pageAligned.sub(4096);
                 }
             }
         }
-        if (found) break;
+        log("[*] Pass 2 (anchor): " + (scanned2 / 1048576).toFixed(0) + " MB scanned, " + anchorHits + " anchor hit(s), header " + (metaBase ? "FOUND" : "not found"));
+    }
+
+    if (metaBase !== null && realSize > 0) {
+        // Sanity signal only: a real metadata always embeds the anchor literal.
+        try {
+            if (Memory.scanSync(metaBase, Math.min(realSize, 80 * 1024 * 1024), anchorPat).length === 0) {
+                log("[!] Warning: anchor string is not inside the candidate - unusual build, dumping anyway.");
+            }
+        } catch (e) { }
+
+        send({ type: 'init_file', name: 'global-metadata.dat', size: realSize });
+        log("[*] Transferring metadata to PC (raw header, normalized on the PC)...");
+
+        try {
+            for (var woff = 0; woff < realSize; woff += MAX_CHUNK) {
+                var remainMeta = realSize - woff;
+                var readSizeMeta = remainMeta < MAX_CHUNK ? remainMeta : MAX_CHUNK;
+                var bufMeta = metaBase.add(woff).readByteArray(readSizeMeta);
+
+                // El header se copia TAL CUAL está en RAM: algunos builds lo
+                // falsean (magic a 0, version a 24) y otros usan un layout
+                // propio (typeDefinition de 92 bytes). dumper_pc.py es quien
+                // normaliza el archivo segun el layout real detectado.
+                send({ type: 'write_chunk', name: 'global-metadata.dat', offset: woff }, bufMeta);
+            }
+            send({ type: 'finish_file', name: 'global-metadata.dat' });
+            found = true;
+        } catch (e) {
+            log("[-] Error transferring metadata: " + e);
+        }
     }
 
     if (!found) {
         log("[-] Could not dynamically resolve metadata in RAM.");
+        log("[-] Diagnostics: candidates=" + candidates.length +
+            " scanned=" + (((scanned1 + (scanned2 || 0)) / 1048576).toFixed(0)) + "MB" +
+            (budgetHit ? " (SCAN BUDGET EXHAUSTED - raise SCAN_BUDGET)" : "") +
+            " magicHits=" + magicHits + " anchorHits=" + anchorHits);
+        rejectNotes.forEach(function (n) { log(n); });
     }
 
     log("\n[+] RAM extraction completed. Handing control over to PC...");

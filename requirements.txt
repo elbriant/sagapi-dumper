@@ -1,4 +1,5 @@
 colorama==0.4.6
+dnfile==0.18.0
 frida==17.7.3
 frida-tools==14.6.0
 prompt_toolkit==3.0.52

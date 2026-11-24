@@ -1,6 +1,6 @@
-# sagapi-dumps
+# sagapi-dumper
 
-Automated tool for the extraction and processing of Unity binaries (`libil2cpp.so` and `global-metadata.dat`) directly from the RAM of any Arknights client, utilizing Frida and Il2CppDumper. Designed to be version-agnostic and server-agnostic. Feeds `sagapi-flatbuffers` via CI.
+Automated tool for the extraction and processing of Unity binaries (`libil2cpp.so` and `global-metadata.dat`) directly from the RAM of any Arknights client, utilizing Frida and Il2CppDumper. Designed to be version-agnostic and server-agnostic. Feeds `sagapi-flatbuffers`.
 
 ## System Requirements
 
@@ -29,13 +29,13 @@ Automated tool for the extraction and processing of Unity binaries (`libil2cpp.s
 The static `Module.findExportByName(null, ...)` form **no longer exists** in Frida 17 — calling it throws `TypeError: not a function`, silently disabling the entire anti-detect layer. The script uses `Process.findModuleByName("libc.so").findExportByName(name)` instead.
 
 ### Frida server port
-`FRIDA_PORT` in `dumper_pc.py` controls how the PC connects to `frida-server`. Default is `27042` (uses `frida.get_usb_device()` with automatic adb forwarding). For a non-standard port, set `FRIDA_PORT` and run `frida-server -l 0.0.0.0:<port>` on the device.
+`FRIDA_PORT` in `dumper_pc.py` controls how the PC connects to `frida-server`. The default in this repo is `37042`; set it to the port frida-server actually listens on (`27042` for a stock frida-server, or the port passed with `-l 0.0.0.0:<port>`).
 
 ### Il2CppDumper console keypress
 **`RequireAnyKey: false` must be set in `il2cppdumper/config.json`.** When `true`, Il2CppDumper calls `Console.ReadKey()` at the end, which throws `InvalidOperationException` when stdin is redirected by `subprocess.run(input=...)`. `setup_il2cppdumper()` patches this automatically after downloading the tool.
 
-### Metadata header
-The first 8 bytes of the assembled `global-metadata.dat` are force-overwritten to magic `AF 1B B1 FA` + version `1D` (29), because the bundled Il2CppDumper v6.7.46 expects a v29 header despite the game's spoofed version (reported as 24).
+### Metadata handling
+`global-metadata.dat` is dumped exactly as it is in RAM. Before running Il2CppDumper, `normalize_metadata()` fixes the magic/version and converts non-standard layouts (e.g. the protected TW builds with 92-byte `typeDefinition` records) to the v29 layout the bundled dumper understands; when needed, it patches the dumper with `dnfile`. If the in-RAM scan fails, the PC recovers the metadata over ADB from `DUMP_APK`, the file extracted by the game, or the installed APK.
 
 ## Usage Instructions
 
@@ -70,6 +70,7 @@ The first 8 bytes of the assembled `global-metadata.dat` are force-overwritten t
    * Checks/downloads Il2CppDumper v6.7.46 (auto-patches `config.json`).
    * Connects to the Arknights process via Frida.
    * Extracts memory blocks from RAM and transfers them to the PC.
+   * Recovers the metadata over ADB if the in-RAM scan fails.
    * Executes Il2CppDumper with the correct memory base address.
 
 ## Configuration
@@ -82,13 +83,15 @@ Edit `dumper_pc.py` (CONFIGURATION section) to adjust:
 | `MAX_ATTEMPTS`   | `5`     | Number of retry attempts if the dump fails.                          |
 | `WAIT_TIMEOUT_S` | `300`   | Seconds to wait for the `done` signal per attempt.                   |
 
+`DUMP_APK` (environment variable) can point to an APK already on the PC; it is used as the first metadata-recovery source when the in-RAM scan fails.
+
 ## Output Structure
 
 The script is built with multi-region support. Upon successful completion:
 
 * `./dumps/[Package_Name]/`: Raw and assembled dumps extracted from RAM (`libil2cpp.so`, `global-metadata.dat`).
 * `./DummyDlls/[Package_Name]/`: Final directory containing the restored DLL files, schemas, and code structures ready for reverse engineering or data-mining.
-  * `DummyDll/*.dll`, `manifest.json` — **committed**.
+  * `DummyDll/*.dll`, `manifest.json` — generated output.
   * `dump.cs`, `il2cpp.h`, `script.json`, `stringliteral.json` — gitignored.
 
 #### Thanks to [Perfare's Il2CppDumper](https://github.com/Perfare/Il2CppDumper/releases)
